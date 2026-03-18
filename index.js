@@ -1,93 +1,114 @@
-// =================== FINAL WORKING BOT ===================
-
-// Global error handler
-process.on("unhandledRejection", (err) => {
-  console.log("Unhandled Error:", err?.message || err);
-});
-
-// Import required modules
 const Imap = require("imap");
 const { simpleParser } = require("mailparser");
-const https = require("https");
-const fetch = require("node-fetch");
+const { Telegraf } = require("telegraf");
 
 // ====== CONFIGURATION ======
 const TOKEN = process.env.TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-const EMAIL = process.env.EMAIL;
-const APP_PASSWORD = process.env.APP_PASSWORD;
-// Function to send Telegram messages with SSL fix
-function sendTelegramMessage(text) {
-  const url = `https://api.telegram.org/bot${TOKEN}/sendMessage`;
 
-  const agent = new https.Agent({
-    rejectUnauthorized: false, // <-- FIX SSL ECONNRESET
-  });
+// Trackers
+let dailyCount = 0;
+const startTime = Date.now();
+const activeConnections = new Set();
 
-  fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: CHAT_ID,
-      text: text,
-    }),
-    agent: agent, // <-- pass the agent
-  })
-    .then(res => res.json())
-    .then(data => console.log("✅ Message sent"))
-    .catch(err => console.log("❌ Telegram Error:", err.message));
-}
+const bot = new Telegraf(TOKEN);
 
-// ====== GMAIL CONFIG ======
-const imap = new Imap({
-  user: EMAIL,
-  password: APP_PASSWORD,
-  host: "imap.gmail.com",
-  port: 993,
-  tls: true,
-  tlsOptions: { rejectUnauthorized: false },
+// ====== TELEGRAM COMMANDS ======
+bot.command("status", (ctx) => {
+    const uptimeSeconds = Math.floor((Date.now() - startTime) / 1000);
+    const hours = Math.floor(uptimeSeconds / 3600);
+    const minutes = Math.floor((uptimeSeconds % 3600) / 60);
+
+    const statusMsg = `🚀 **Bot Status Report**\n\n` +
+        `✅ **Status:** Active\n` +
+        `📧 **Active Inboxes:** ${activeConnections.size}\n` +
+        `📬 **Emails Processed Today:** ${dailyCount}\n` +
+        `⏳ **Uptime:** ${hours}h ${minutes}m\n\n` +
+        `_Note: If connection is lost, Railway will auto-restart the process._`;
+
+    ctx.replyWithMarkdown(statusMsg);
 });
 
-// Function to open inbox
-function openInbox(cb) {
-  imap.openBox("INBOX", false, cb);
-}
+// Start Telegram Bot
+bot.launch();
+console.log("🤖 Telegram Bot command listener started");
 
-// IMAP ready event
-imap.once("ready", function () {
-  console.log("✅ Connected to Gmail");
+// ====== MULTI-EMAIL LOGIC ======
+function connectEmail(email, password) {
+    if (!email || !password) return;
 
-  openInbox(function (err, box) {
-    if (err) throw err;
+    const imap = new Imap({
+        user: email,
+        password: password,
+        host: "imap.gmail.com",
+        port: 993,
+        tls: true,
+        tlsOptions: { rejectUnauthorized: false },
+    });
 
-    // Listen for new mail
-    imap.on("mail", function () {
-      console.log("📩 New mail detected");
-
-      const imapFetch = imap.seq.fetch(box.messages.total + ":*", {
-        bodies: "",
-      });
-
-      imapFetch.on("message", function (msg) {
-        msg.on("body", function (stream) {
-          simpleParser(stream, async (err, parsed) => {
+    imap.once("ready", () => {
+        console.log(`✅ Connected: ${email}`);
+        activeConnections.add(email);
+        
+        imap.openBox("INBOX", false, (err, box) => {
             if (err) return;
 
-            const text = `
-📩 New Email!
+            imap.on("mail", () => {
+                const f = imap.seq.fetch(box.messages.total + ":*", { bodies: "" });
+                f.on("message", (msg) => {
+                    msg.on("body", (stream) => {
+                        simpleParser(stream, async (err, parsed) => {
+                            if (err) return;
+                            dailyCount++;
 
-From: ${parsed.from.text}
-Subject: ${parsed.subject}
-`;
+                            // Create a short summary (first 200 characters)
+                            const summary = parsed.text ? parsed.text.substring(0, 200).replace(/\n/g, " ") + "..." : "No text content";
 
-            // Send message to Telegram
-            sendTelegramMessage(text);
-          });
+                            const text = `📩 **New Email Alert!**\n\n` +
+                                `📥 **To Inbox:** ${email}\n` +
+                                `👤 **From:** ${parsed.from.text}\n` +
+                                `📝 **Subject:** ${parsed.subject}\n\n` +
+                                `📖 **Summary:** ${summary}`;
+
+                            bot.telegram.sendMessage(CHAT_ID, text, { parse_mode: "Markdown" });
+                        });
+                    });
+                });
+            });
         });
-      });
     });
-  });
-});
 
-// Connect to Gmail
-imap.connect();
+    imap.on("error", (err) => {
+        console.log(`❌ Error [${email}]:`, err.message);
+        activeConnections.delete(email);
+    });
+
+    imap.on("close", () => {
+        console.log(`🔌 Connection closed [${email}]. Reconnecting in 30s...`);
+        activeConnections.delete(email);
+        setTimeout(() => imap.connect(), 30000); // Auto-reconnect script
+    });
+
+    imap.connect();
+}
+
+// Initialize all accounts (Add EMAIL2, EMAIL3 etc. in Railway)
+const emailList = [
+    { user: process.env.EMAIL, pass: process.env.APP_PASSWORD },
+    { user: process.env.EMAIL2, pass: process.env.PASS2 },
+    { user: process.env.EMAIL3, pass: process.env.PASS3 },
+    { user: process.env.EMAIL4, pass: process.env.PASS4 },
+    { user: process.env.EMAIL5, pass: process.env.PASS5 }
+];
+
+emailList.forEach(acc => connectEmail(acc.user, acc.pass));
+
+// Reset counter at midnight
+setInterval(() => {
+    const now = new Date();
+    if (now.getHours() === 0 && now.getMinutes() === 0) dailyCount = 0;
+}, 60000);
+
+// Global Error Handling to prevent crashing
+process.on("uncaughtException", (err) => console.error("Uncaught Exception:", err));
+process.on("unhandledRejection", (err) => console.error("Unhandled Rejection:", err));
